@@ -2,73 +2,103 @@ pipeline {
     agent any
 
     environment {
-        DEPLOY_PATH = '/usr/share/nginx/html'
-        EXPECTED_VERSION = 'v1.0'
+        AWS_REGION = 'ap-south-1'
+        AWS_ACCOUNT_ID = '660463066160'
+        ECR_REPO = 'task-tracker'
+        IMAGE_NAME = '660463066160.dkr.ecr.ap-south-1.amazonaws.com/task-tracker'
         STUDENT_NAME = 'Krishnav Wadhera'
         STUDENT_PRN = '1262243616'
+        EXPECTED_VERSION = 'v1.0'
     }
 
     stages {
         stage('Checkout') {
             steps {
-                echo "Checking out source code from repository..."
+                echo "Checking out source code from GitHub repository..."
                 checkout scm
             }
         }
 
-        stage('Validate File') {
+        stage('Build and Test') {
             steps {
-                echo "Validating index.html existence and integrity..."
+                echo "Running validation and quality tests on project files..."
                 sh '''
                     if [ ! -f index.html ]; then
                         echo "ERROR: index.html not found!"
                         exit 1
                     fi
-                    echo "SUCCESS: index.html exists."
+                    grep -q "CI/CD Pipeline Demo" index.html || { echo "ERROR: Missing Heading"; exit 1; }
+                    grep -q "${STUDENT_NAME}" index.html || { echo "ERROR: Missing Student Name"; exit 1; }
+                    grep -q "${STUDENT_PRN}" index.html || { echo "ERROR: Missing PRN"; exit 1; }
+                    grep -q "${EXPECTED_VERSION}" index.html || { echo "ERROR: Missing Version"; exit 1; }
+                    echo "SUCCESS: Code quality and integrity validation passed."
                 '''
             }
         }
 
-        stage('Test & Quality Check') {
+        stage('Docker Build') {
             steps {
-                echo "Running validation checks on index.html content..."
+                echo "Building Docker container image..."
                 sh '''
-                    grep -q "CI/CD Pipeline Demo" index.html || { echo "Missing Heading"; exit 1; }
-                    grep -q "Krishnav Wadhera" index.html || { echo "Missing Student Name"; exit 1; }
-                    grep -q "1262243616" index.html || { echo "Missing PRN"; exit 1; }
-                    grep -q "${EXPECTED_VERSION}" index.html || { echo "Missing or incorrect version"; exit 1; }
-                    echo "SUCCESS: All quality tests and student verification checks passed."
+                    docker build -t ${ECR_REPO}:${BUILD_NUMBER} -t ${IMAGE_NAME}:latest -t ${IMAGE_NAME}:${BUILD_NUMBER} .
+                    echo "SUCCESS: Docker image built successfully."
                 '''
             }
         }
 
-        stage('Deploy to Web Server') {
+        stage('Push Image') {
             steps {
-                echo "Deploying index.html to Nginx web root at ${DEPLOY_PATH}..."
+                echo "Authenticating with Amazon ECR and pushing image..."
                 sh '''
-                    cp -f index.html ${DEPLOY_PATH}/index.html
-                    chmod 644 ${DEPLOY_PATH}/index.html
-                    echo "SUCCESS: Page deployed to Nginx."
+                    aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+                    docker push ${IMAGE_NAME}:latest
+                    docker push ${IMAGE_NAME}:${BUILD_NUMBER}
+                    echo "SUCCESS: Image pushed to Amazon ECR repository: ${IMAGE_NAME}:latest"
                 '''
             }
         }
 
-        stage('Verify Deployment') {
+        stage('Deploy to Minikube') {
             steps {
-                echo "Verifying HTTP response and deployed version from local server..."
+                echo "Configuring Kubernetes cluster and deploying application..."
                 sh '''
-                    HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost/)
-                    echo "HTTP Status Code: ${HTTP_STATUS}"
-                    if [ "${HTTP_STATUS}" -ne 200 ]; then
-                        echo "ERROR: Web server returned HTTP ${HTTP_STATUS} instead of 200"
+                    export KUBECONFIG=/home/ec2-user/.kube/config
+                    # Update or create ECR pull secret in Kubernetes
+                    kubectl delete secret ecr-secret --ignore-not-found
+                    ECR_TOKEN=$(aws ecr get-login-password --region ${AWS_REGION})
+                    kubectl create secret docker-registry ecr-secret \
+                        --docker-server=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com \
+                        --docker-username=AWS \
+                        --docker-password="${ECR_TOKEN}"
+                    
+                    # Apply deployment and service manifests
+                    kubectl apply -f k8s/deployment.yaml
+                    kubectl apply -f k8s/service.yaml
+                    
+                    # Wait for deployment rollout
+                    kubectl rollout status deployment/task-tracker --timeout=180s
+                    echo "SUCCESS: Kubernetes deployment and NodePort service applied."
+                '''
+            }
+        }
+
+        stage('Verification') {
+            steps {
+                echo "Verifying Kubernetes pods, deployment and application availability..."
+                sh '''
+                    export KUBECONFIG=/home/ec2-user/.kube/config
+                    kubectl get pods -l app=task-tracker -o wide
+                    kubectl get deployment task-tracker
+                    kubectl get svc task-tracker
+                    
+                    # Check pod running state
+                    RUNNING_PODS=$(kubectl get pods -l app=task-tracker --no-headers | grep "Running" | wc -l)
+                    if [ "${RUNNING_PODS}" -lt 1 ]; then
+                        echo "ERROR: No pods running for task-tracker!"
                         exit 1
                     fi
-
-                    curl -s http://localhost/ | grep -q "${EXPECTED_VERSION}" || {
-                        echo "ERROR: Deployed page does not show expected version ${EXPECTED_VERSION}"
-                        exit 1
-                    }
-                    echo "SUCCESS: Web page returned HTTP 200 and correctly displays ${EXPECTED_VERSION}!"
+                    
+                    echo "SUCCESS: All verification checks passed. Application is live on port 30080."
                 '''
             }
         }
@@ -76,7 +106,7 @@ pipeline {
 
     post {
         success {
-            echo "Pipeline completed successfully! CI/CD demonstration for ${STUDENT_NAME} (${STUDENT_PRN}) is LIVE."
+            echo "Pipeline completed successfully! Task Tracker application for ${STUDENT_NAME} (${STUDENT_PRN}) is deployed on Kubernetes."
         }
         failure {
             echo "Pipeline failed. Check stage logs for details."
